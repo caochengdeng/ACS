@@ -2,7 +2,7 @@ import copy
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 import torch
-from ACS_Agent import PPO, RolloutBuffer
+from ACS_Agent import ACSAgent, RolloutBuffer
 import highway_env
 import time
 
@@ -36,7 +36,7 @@ def set_seed(seed):
 
 set_seed(12)
 
-agent = PPO(n_states=n_states,
+agent = ACSAgent(n_states=n_states,
             n_actions=nvecs_actions,
             actor_lr=actor_lr,
             critic_lr=critic_lr,

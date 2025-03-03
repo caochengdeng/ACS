@@ -4,7 +4,7 @@ import os
 from ACS_Agent import PolicyNet, ValueNet, SafetyNet
 
 
-class PPO:
+class ACSAgent:
     def __init__(self, n_states, n_actions, device, crt):
         self.actor = PolicyNet(n_states, n_actions).to(device)
         self.critic = ValueNet(n_states).to(device)
