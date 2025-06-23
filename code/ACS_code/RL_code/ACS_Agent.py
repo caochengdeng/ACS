@@ -1,20 +1,179 @@
-import os
-import math
+# Code for discrete environment model
+import copy
 import random
+
 import numpy as np
 import torch
-import torch.optim as optim
-import torch.nn.functional as F
+from torch import nn
+from torch.nn import functional as F
+import os
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
-import torch.nn as nn
-
-from ACS.common.buffer import SafetyBuffer
-from ACS.models.actor_critic import PolicyNet, ValueNet
-from ACS.models.safety import SafetyNet
-from ACS.envs.highway_env import HighwayEnv
+import time
+import math
+import highway_env
 
 
-class ACSADP:
+class SafetyBuffer:
+    def __init__(self):
+        self.safety_list = []
+        self.safety_list_spare = []
+
+    def clear(self):
+        print("Safety Buffer length:{}".format(len(self.safety_list)))
+        del self.safety_list[:]
+        self.safety_list = copy.deepcopy(self.safety_list_spare)
+        del self.safety_list_spare[:]
+
+    def quantile(self, Q):
+        S_safety = torch.tensor(self.safety_list)
+        return torch.quantile(S_safety, Q / 10)  # 传入小数
+
+
+# Buffer
+class RolloutBuffer:
+    """
+    Buffer for storing episode data
+    """
+
+    def __init__(self):
+        self.actions = []  # Actions
+        self.states = []  # States
+        self.next_states = []
+        self.rewards = []  # Rewards
+        self.is_terminals = []  # Terminal
+        self.rewards_safety = []  # Collision penalties
+        self.next_actions_safety = []
+        self.actions_safety = []
+
+    def clear(self):
+        """
+        Clear the buffer
+        """
+        del self.actions[:]
+        del self.states[:]
+        del self.next_states[:]
+        del self.rewards[:]
+        del self.is_terminals[:]
+        del self.rewards_safety[:]
+        del self.next_actions_safety[:]
+        del self.actions_safety[:]
+
+
+def orthogonal_init(layer, gain=1.0):
+    """
+    Orthogonal initialization
+    """
+    nn.init.orthogonal_(layer.weight, gain=gain)
+    nn.init.constant_(layer.bias, 0)
+
+
+# ----------------------------------- #
+# Build policy network -- actor
+# ----------------------------------- #
+class PolicyNet(nn.Module):
+    def __init__(self, n_states, nvecs_actions):
+        super(PolicyNet, self).__init__()
+        self.fc1 = nn.Linear(n_states, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.ModuleList([nn.Linear(64, n) for n in nvecs_actions])
+
+        # self._initialize_weights()
+        orthogonal_init(self.fc1)
+        orthogonal_init(self.fc2)
+        for layer in self.fc3:
+            orthogonal_init(layer, gain=0.01)
+
+    # def _initialize_weights(self):
+    #     for m in self.modules():
+    #         if isinstance(m, nn.Linear):
+    #             nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain('tanh'))
+    #             if m.bias is not None:
+    #                 nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = F.leaky_relu(x)
+        x = self.fc2(x)
+        x1 = F.leaky_relu(x)
+        x = [F.softmax(layer(x1), dim=-1) for layer in self.fc3]  # Calculate probability of each action
+        if torch.isnan(x[0]).any():
+            print(x)  # 寻找是否传入空
+        return x
+
+
+# ----------------------------------- #
+# Build value network -- critic
+# ----------------------------------- #
+
+class ValueNet(nn.Module):
+    def __init__(self, n_states):
+        super(ValueNet, self).__init__()
+        self.fc1 = nn.Linear(n_states, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 1)
+
+        orthogonal_init(self.fc1)
+        orthogonal_init(self.fc2)
+        orthogonal_init(self.fc3)
+        # self._initialize_weights()
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = F.leaky_relu(x)
+        x = self.fc2(x)  # Evaluate current state value
+        x = F.leaky_relu(x)
+        x = self.fc3(x)
+        return x
+
+
+# ----------------------------------- #
+# Build safety network -- safety
+# ----------------------------------- #
+
+class SafetyNet(nn.Module):
+    def __init__(self, n_states):
+        super(SafetyNet, self).__init__()
+        self.fc1 = nn.Linear(2, 64)
+        self.fc2 = nn.Linear(64, 8)
+
+        self.f1 = nn.Linear(n_states, 64)
+        self.f2 = nn.Linear(64, 32)
+        self.f3 = nn.Linear(32, 16)
+        self.fc3 = nn.Linear(24, 24)
+        self.fc4 = nn.Linear(24, 1)
+
+        # orthogonal_init(self.fc1)
+        # orthogonal_init(self.fc2)
+        # orthogonal_init(self.f1)
+        # orthogonal_init(self.f2)
+        # orthogonal_init(self.f3)
+        # orthogonal_init(self.fc3)
+
+    def forward(self, x1, x2):
+        x1 = x1.to(dtype=torch.float)
+        x1 = self.fc1(x1)
+        x1 = F.leaky_relu(x1)
+        x1 = self.fc2(x1)
+        x1 = F.leaky_relu(x1)
+
+        x2 = self.f1(x2)
+        x2 = F.leaky_relu(x2)
+        x2 = self.f2(x2)
+        x2 = F.leaky_relu(x2)
+        x2 = self.f3(x2)
+        x2 = F.leaky_relu(x2)
+        x = torch.cat([x1, x2], dim=1)
+        x = self.fc3(x)
+        x = F.leaky_relu(x)
+        x = torch.clamp(-self.fc4(x), max=0)
+        return x
+
+
+# ----------------------------------- #
+# 构建模型
+# ----------------------------------- #
+
+class PPO:
     def __init__(self, n_states, n_actions,
                  actor_lr, critic_lr, safety_lr, lmbda, epochs, eps, gamma, vf_coef, ent_coef, max_grad_norm,
                  batch_size, max_step,
@@ -27,15 +186,15 @@ class ACSADP:
         self.safety = SafetyNet(n_states).to(device)
 
         # Optimizer for policy network
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.scheduler_actor = torch.optim.lr_scheduler.ExponentialLR(self.actor_optimizer, gamma=0.994)
 
         # Optimizer for value network
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
         self.scheduler_critic = torch.optim.lr_scheduler.ExponentialLR(self.critic_optimizer, gamma=0.994)
 
         # Optimizer for safety network
-        self.safety_optimizer = optim.Adam(self.safety.parameters(), lr=safety_lr)
+        self.safety_optimizer = torch.optim.Adam(self.safety.parameters(), lr=safety_lr)
         self.scheduler_safety = torch.optim.lr_scheduler.ExponentialLR(self.safety_optimizer, gamma=0.994)
 
         self.gamma = gamma
@@ -55,6 +214,7 @@ class ACSADP:
         self.s_criteria = -50 * self.gamma ** 50
         self.safety_buffer = SafetyBuffer()
 
+    # 动作选择
     def take_action(self, state, action_rule, If_updata=False):
         self.steps += 1
         # Dimension change [n_state]-->tensor[1,n_states]
@@ -77,12 +237,17 @@ class ACSADP:
         if not If_updata:
             self.safety_buffer.safety_list.append(safety_value_actor.tolist())
         else:
-            self.safety_buffer.safety_list_spare.append(safety_value_actor.tolist())
+            self.safety_buffer.safety_list_spare.append(safety_value_actor.tolist())  # 在进行优化时,将优化过程中的输出记录下来,不浪费
         # self.safety_buffer.safetybuffer.append(safety_value_rule)
 
         action_make = actions if self.ExplorationFunction(safety_value_actor, safety_value_rule, self.steps,
                                                           If_update=If_updata) else action_rule
 
+        # print(safety_value_actor, safety_value_rule)
+        # print(torch.tensor(np.array(actions)).to(self.device))
+        # print(torch.tensor(np.array(action_rule)).to(self.device))
+        # action_make = actions if (safety_value_actor + 0.1) >= safety_value_rule else action_rule
+        # action_make = actions
         return action_make, actions
 
     def ExplorationFunction(self, s_actor, s_rule, step, If_update=False):
@@ -106,7 +271,7 @@ class ACSADP:
 
     def Update_Criteria(self):
         print('update s_criteria...')
-        env = HighwayEnv()
+        env = highway_env_im.HighwayEnv()
         reward_all = []
         success_rate = []
         s_criteria_list = []
@@ -160,15 +325,20 @@ class ACSADP:
         next_actions_safety = torch.tensor(buffer.next_actions_safety, dtype=torch.float).to(self.device)
         actions_safety = torch.tensor(buffer.actions_safety, dtype=torch.float).to(self.device)
 
+        # print(next_actions)
+        # print(next_actions.shape)
+
         next_q_target = self.critic(next_states)
         td_target = rewards + self.gamma * next_q_target * (1 - dones)
         td_value = self.critic(states)
         td_delta = td_target - td_value
         td_delta = td_delta.cpu().detach().numpy()
 
-        next_s_target = self.safety(next_actions_safety, next_states[:-1])
-
-        td_safety_target = rewards_safety[:-1] + self.gamma * next_s_target * (1 - dones[:-1])
+        next_s_target = self.safety(next_actions_safety, next_states[:-1])  # 使用2047步更新
+        # print(next_s_target.shape)
+        # print(rewards_safety[:-1].shape)
+        td_safety_target = rewards_safety[:-1] + self.gamma * next_s_target * (1 - dones[:-1])  # 2047
+        # td_safety_value = self.safety(actions[:-1], states[:-1])  # 其实此处的actions相当于第一步的动作，还需要求取下一步的动作
 
         advantage = 0
         advantage_list = []
@@ -208,6 +378,9 @@ class ACSADP:
 
                 critic_loss = torch.mean(F.mse_loss(self.critic(states[index]), td_target[index].detach()))
 
+                # if buffer_capacity - 1 in index: index.remove(buffer_capacity - 1)
+                # safety_loss = torch.max(
+                #     F.mse_loss(self.safety(actions_safety[index], states[index]), td_safety_target[index].detach()))
                 if buffer_capacity - 1 in index: index.remove(buffer_capacity - 1)
                 safety_loss = torch.mean(
                     F.mse_loss(self.safety(actions_safety[index], states[index]), td_safety_target[index].detach()))
@@ -227,7 +400,7 @@ class ACSADP:
                 self.critic_optimizer.step()
                 self.safety_optimizer.step()
             if u == self.epochs - 1:
-                self.write.add_scalar('.', actor_loss, self.steps)
+                self.write.add_scalar('.', actor_loss, self.steps)  # 全局步数
                 self.write.add_scalar('.', critic_loss, self.steps)
                 self.write.add_scalar('.', safety_loss, self.steps)
                 self.write.add_scalar('.', self.actor_optimizer.state_dict()['param_groups'][0]['lr'],
